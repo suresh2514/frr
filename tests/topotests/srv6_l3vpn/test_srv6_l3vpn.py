@@ -189,24 +189,6 @@ def setup_module(mod):
             router.run("ip addr add 172.16.22.6/24 dev r6-eth3")
             router.run("ip -6 addr add 2001:cafe:22::6/64 dev r6-eth3")
 
-    # Add SRv6 seg6local routes for PE routers (must be after router start)
-    for rname in ["r3", "r6"]:
-        router = router_list[rname]
-
-        # Add seg6local routes for SRv6 decapsulation
-        if rname == "r3":
-            # Add seg6local routes for r3 SRv6 locator 2001:dead:30::/64
-            router.run("ip -6 route add 2001:dead:30:0:3:: encap seg6local action End.DT4 vrftable 1001 dev Client1")
-            router.run("ip -6 route add 2001:dead:30:0:4:: encap seg6local action End.DT6 vrftable 1001 dev Client1")
-            router.run("ip -6 route add 2001:dead:30:0:5:: encap seg6local action End.DT4 vrftable 1002 dev Client2")
-            router.run("ip -6 route add 2001:dead:30:0:6:: encap seg6local action End.DT6 vrftable 1002 dev Client2")
-        elif rname == "r6":
-            # Add seg6local routes for r6 SRv6 locator 2001:dead:60::/64
-            router.run("ip -6 route add 2001:dead:60:0:3:: encap seg6local action End.DT4 vrftable 1001 dev Client1")
-            router.run("ip -6 route add 2001:dead:60:0:4:: encap seg6local action End.DT6 vrftable 1001 dev Client1")
-            router.run("ip -6 route add 2001:dead:60:0:5:: encap seg6local action End.DT4 vrftable 1002 dev Client2")
-            router.run("ip -6 route add 2001:dead:60:0:6:: encap seg6local action End.DT6 vrftable 1002 dev Client2")
-
 
 def teardown_module():
     "Teardown the pytest environment"
