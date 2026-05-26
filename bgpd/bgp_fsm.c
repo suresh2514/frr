@@ -771,7 +771,7 @@ static void bgp_set_llgr_stale(struct peer *peer, afi_t afi, safi_t safi)
 							"%pBP Long-lived set stale community (LLGR_STALE) for: %pFX",
 							peer, &dest->rn->p);
 
-					attr = *pi->attr;
+					bgp_attr_dup_into(&attr, pi->attr);
 					bgp_attr_add_llgr_community(&attr);
 					pi->attr = bgp_attr_intern(&attr);
 					bgp_process(bgp, rm, pi, afi, safi);
@@ -800,7 +800,7 @@ static void bgp_set_llgr_stale(struct peer *peer, afi_t afi, safi_t safi)
 						"%pBP Long-lived set stale community (LLGR_STALE) for: %pFX",
 						peer, &dest->rn->p);
 
-				attr = *pi->attr;
+				bgp_attr_dup_into(&attr, pi->attr);
 				bgp_attr_add_llgr_community(&attr);
 				pi->attr = bgp_attr_intern(&attr);
 				bgp_process(bgp, dest, pi, afi, safi);
@@ -881,10 +881,39 @@ static void bgp_graceful_stale_timer_expire(struct event *event)
 		zlog_debug("%pBP graceful restart stalepath timer expired for %s", peer,
 			   bgp_peer_get_connection_direction_string(connection));
 
-	/* NSF delete stale route */
-	FOREACH_AFI_SAFI_NSF (afi, safi)
-		if (peer->nsf[afi][safi])
-			bgp_clear_stale_route(peer, afi, safi);
+	/*
+	 * RFC 9494 §4.3: for LLGR-negotiated AFI/SAFI, retention is bounded
+	 * by the Long-Lived Stale Time, not stalepath-time. Skip the delete
+	 * if LLGR retention is (or will be) active for this AFI/SAFI:
+	 *   - t_llgr_stale[afi][safi] scheduled: the LLGR window is already
+	 *     running; t_gr_restart has fired but didn't cancel t_gr_stale
+	 *     (bgp_graceful_restart_timer_off() bails when any AFI/SAFI is
+	 *     in PEER_STATUS_LLGR_WAIT).
+	 *   - t_gr_restart scheduled and LLGR negotiated for this AFI/SAFI:
+	 *     still in the restart-time window; t_llgr_stale will be armed
+	 *     by bgp_graceful_restart_timer_expire() when t_gr_restart fires.
+	 * Using the t_llgr_stale scheduled state (rather than the configured
+	 * stale_time) also covers the case where stale_time is reconfigured
+	 * to 0 mid-flight while the timer is still running.
+	 * Non-LLGR AFI/SAFIs keep the original delete-now behaviour.
+	 */
+	FOREACH_AFI_SAFI_NSF (afi, safi) {
+		if (!peer->nsf[afi][safi])
+			continue;
+
+		if (event_is_scheduled(peer->t_llgr_stale[afi][safi]) ||
+		    (peer->llgr[afi][safi].stale_time &&
+		     event_is_scheduled(connection->t_gr_restart))) {
+			if (bgp_debug_neighbor_events(peer))
+				zlog_debug("%pBP graceful restart stalepath timer expired for %s: LLGR active for %s, skip stale route clear",
+					   peer,
+					   bgp_peer_get_connection_direction_string(connection),
+					   get_afi_safi_str(afi, safi, false));
+			continue;
+		}
+
+		bgp_clear_stale_route(peer, afi, safi);
+	}
 }
 
 /*
@@ -2815,6 +2844,7 @@ static void bgp_peer_process_gr_cap_clear_stale(struct peer *peer)
 	}
 
 	UNSET_FLAG(peer->sflags, PEER_STATUS_NSF_WAIT);
+	peer->notify.hard_reset = false;
 	FOREACH_AFI_SAFI_NSF (afi, safi) {
 		if (peer->afc_nego[afi][safi] && CHECK_FLAG(peer->cap, PEER_CAP_RESTART_ADV) &&
 		    CHECK_FLAG(peer->af_cap[afi][safi], PEER_CAP_RESTART_AF_RCV)) {

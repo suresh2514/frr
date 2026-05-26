@@ -2012,6 +2012,61 @@ static void ospf_ls_upd(struct ospf *ospf, struct ip *iph,
 			if (Flag)
 				continue;
 		}
+		/* Make sure that this is not a stale LSA (after a reboot) that originated from this
+		 * router. If that is the case, refresh the local LSA.
+		 * RFC 2328 Section 13.4:
+		 * https://datatracker.ietf.org/doc/html/rfc2328#page-151
+		 *
+		 * Opaque LSAs are handled above and via ospf_process_self_originated_lsa().
+		 */
+		if (IPV4_ADDR_SAME(&lsa->data->adv_router, &oi->ospf->router_id) &&
+		    !IS_OPAQUE_LSA(lsa->data->type)) {
+			if (current == NULL) {
+				/* RFC 2328 Section 13.4:
+				 * It may be the case the router no longer wishes to originate the
+				 * received LSA. ... Instead of updating the LSA, the LSA should be
+				 * flushed from the routing domain by incrementing the received
+				 * LSA's LS age to MaxAge and reflooding.
+				 */
+				struct ospf_lsa *ls_req;
+
+				if (IS_DEBUG_OSPF(lsa, LSA))
+					zlog_debug("%s: Link State Update[%s]: router-id is local, but no current LSA - setting to MaxAge",
+						   __func__, dump_lsa_key(lsa));
+
+				/* Immediately Ack to stop retransmitting the LSA */
+				ospf_ls_ack_send_direct(nbr, lsa);
+				/* Remove from request list, we are overriding */
+				ls_req = ospf_ls_request_lookup(nbr, lsa);
+				if (ls_req != NULL) {
+					ospf_ls_request_delete(nbr, ls_req);
+					ospf_check_nbr_loading(nbr);
+				}
+
+				/* Set LSA age to MaxAge to flush this stale instance. */
+				LS_AGE_SET(lsa, OSPF_LSA_MAXAGE);
+
+			} else if (ospf_lsa_more_recent(lsa, current) > 0) {
+				/* RFC 2328 Section 13.4:
+				 * If the received self-originated LSA is newer than the
+				 * last instance that the router actually originated, the router
+				 * must take special action. ... the router must then advance the LSA's LS
+				 * sequence number one past the received LS sequence number, and
+				 * originate a new instance of the LSA.
+				 */
+				if (IS_DEBUG_OSPF(lsa, LSA))
+					zlog_debug("%s: Link State Update[%s]: router-id is local, but has higher seq num",
+						   __func__, dump_lsa_key(lsa));
+				current->data->ls_seqnum = lsa->data->ls_seqnum;
+				ospf_lsa_refresh(oi->ospf, current);
+				/* Discarding without ACK may cause neighbor to retransmit the stale LSA
+				 * until the refreshed LSA arrives, make sure that doesn't happen.
+				 */
+				ospf_ls_ack_send_direct(nbr, lsa);
+				DISCARD_LSA(lsa, 10);
+				continue;
+			}
+		}
 
 		/* (5) Find the instance of this LSA that is currently contained
 		   in the router's link state database.  If there is no
@@ -2718,6 +2773,72 @@ static unsigned ospf_packet_examin(struct ospf_header *oh,
 	return ret;
 }
 
+/*
+ * On PtP/VLinks, neighbor structures are indexed by router-ID. Quick neighbors
+ * are created under the source address until the router ID is known.
+ */
+static void ospf_qnbr_rekey_ptp_vlink(struct ospf_interface *oi, const struct in_addr *src,
+				      struct ospf_neighbor *qnbr)
+{
+	struct prefix oldk, newk;
+	struct route_node *oldrn, *newrn;
+	struct ospf_neighbor *existing;
+
+	memset(&oldk, 0, sizeof(oldk));
+	oldk.family = AF_INET;
+	oldk.prefixlen = IPV4_MAX_BITLEN;
+	oldk.u.prefix4 = *src;
+
+	memset(&newk, 0, sizeof(newk));
+	newk.family = AF_INET;
+	newk.prefixlen = IPV4_MAX_BITLEN;
+	newk.u.prefix4 = qnbr->router_id;
+
+	/* First check if the router-id slot is already occupied. */
+	existing = NULL;
+	newrn = route_node_lookup(oi->nbrs, &newk);
+	if (newrn) {
+		existing = newrn->info;
+		route_unlock_node(newrn);
+	}
+
+	/*
+	 * If another neighbor already exists under the router-id key, prefer it
+	 * and delete the quick placeholder to avoid orphaning it.
+	 */
+	if (existing && existing != qnbr) {
+		if (IS_DEBUG_OSPF_QNBR)
+			zlog_debug("%s: router-id keyed neighbor already exists for %pI4 on %s",
+				   __func__, &qnbr->router_id, IF_NAME(oi));
+
+		oldrn = route_node_lookup(oi->nbrs, &oldk);
+		if (oldrn) {
+			if (oldrn->info == qnbr) {
+				oldrn->info = NULL;
+				route_unlock_node(oldrn);
+			}
+			route_unlock_node(oldrn);
+		}
+
+		ospf_nbr_free(qnbr);
+	} else {
+		newrn = route_node_get(oi->nbrs, &newk);
+		if (!newrn->info)
+			newrn->info = qnbr;
+		else
+			route_unlock_node(newrn);
+
+		oldrn = route_node_lookup(oi->nbrs, &oldk);
+		if (oldrn) {
+			if (oldrn->info == qnbr) {
+				oldrn->info = NULL;
+				route_unlock_node(oldrn);
+			}
+			route_unlock_node(oldrn);
+		}
+	}
+}
+
 /* OSPF Header verification. */
 static int ospf_verify_header(struct stream *ibuf, struct ospf_interface *oi,
 			      struct ip *iph, struct ospf_header *ospfh)
@@ -2744,6 +2865,38 @@ static int ospf_verify_header(struct stream *ibuf, struct ospf_interface *oi,
 	 * required. */
 	if (!ospf_auth_check(oi, iph, ospfh))
 		return -1;
+
+	/* Check for quick neighbors. Update router-id and send immediate hellos if needed */
+	if (oi->num_q_nbrs) {
+		struct ospf_neighbor *qnbr;
+		struct in_addr src;
+
+		src.s_addr = iph->ip_src.s_addr;
+		qnbr = ospf_nbr_lookup_by_addr(oi->nbrs, &src);
+		if (qnbr && qnbr->router_id.s_addr == 0) {
+			if (IS_DEBUG_OSPF_QNBR)
+				zlog_debug("%s: Quick neighbor learned router-id, qnbr=%pI4, router-id=%pI4",
+					   __func__, &src, &ospfh->router_id);
+			/* Fix the router-id and trigger a new hello to be sent */
+			qnbr->router_id = ospfh->router_id;
+			/* This is no longer a "quick" neighbor now that we know the router-id */
+			if (oi->num_q_nbrs)
+				oi->num_q_nbrs--;
+
+			/*
+			 * On Point-to-Point and Virtual-Link interfaces, the neighbor
+			 * table is indexed by router-id. Quick neighbors are created
+			 * (temporarily) under their source address; once the router-id
+			 * is known, re-key the entry to avoid duplicate neighbors.
+			 */
+			if (oi->type == OSPF_IFTYPE_VIRTUALLINK ||
+			    oi->type == OSPF_IFTYPE_POINTOPOINT)
+				ospf_qnbr_rekey_ptp_vlink(oi, &src, qnbr);
+
+			OSPF_ISM_EVENT_EXECUTE(oi, ISM_NeighborChange);
+			ospf_hello_send(oi);
+		}
+	}
 
 	return 0;
 }

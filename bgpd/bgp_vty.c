@@ -9716,64 +9716,65 @@ DEFPY (no_neighbor_soo,
 }
 
 /* "neighbor allowas-in" */
-DEFUN (neighbor_allowas_in,
+DEFPY (neighbor_allowas_in,
        neighbor_allowas_in_cmd,
-       "neighbor <A.B.C.D|X:X::X:X|WORD> allowas-in [<(1-10)|origin>]",
+       "neighbor <A.B.C.D|X:X::X:X|WORD>$neighbor allowas-in [route-map RMAP_NAME$rmap_name] [<(1-10)$allow_num|origin$origin_kw>]",
        NEIGHBOR_STR
        NEIGHBOR_ADDR_STR2
        "Accept as-path with my AS present in it\n"
+       "Filter routes using route-map\n"
+       "Name of route-map\n"
        "Number of occurrences of AS number\n"
        "Only accept my AS in the as-path if the route was originated in my AS\n")
 {
-	int idx_peer = 1;
-	int idx_number_origin = 3;
 	int ret;
-	bool origin = false;
 	struct peer *peer;
-	int allow_num = 0;
+	int allow_num_val;
+	bool origin = !!origin_kw;
 
-	peer = peer_and_group_lookup_vty(vty, argv[idx_peer]->arg);
+	peer = peer_and_group_lookup_vty(vty, neighbor);
 	if (!peer)
 		return CMD_WARNING_CONFIG_FAILED;
 
-	if (argc <= idx_number_origin)
-		allow_num = BGP_ALLOWAS_IN_DEFAULT;
-	else {
-		if (argv[idx_number_origin]->type == WORD_TKN)
-			origin = true;
-		else
-			allow_num = atoi(argv[idx_number_origin]->arg);
-	}
+	if (origin)
+		allow_num_val = 0;
+	else if (allow_num)
+		allow_num_val = (int)allow_num;
+	else
+		allow_num_val = BGP_ALLOWAS_IN_DEFAULT;
 
-	ret = peer_allowas_in_set(peer, bgp_node_afi(vty), bgp_node_safi(vty),
-				  allow_num, origin);
+	ret = peer_allowas_in_set(peer, bgp_node_afi(vty), bgp_node_safi(vty), allow_num_val,
+				  origin, rmap_name);
 
 	return bgp_vty_return(vty, ret);
 }
 
 ALIAS_HIDDEN(
 	neighbor_allowas_in, neighbor_allowas_in_hidden_cmd,
-	"neighbor <A.B.C.D|X:X::X:X|WORD> allowas-in [<(1-10)|origin>]",
+	"neighbor <A.B.C.D|X:X::X:X|WORD>$neighbor allowas-in [route-map RMAP_NAME$rmap_name] [<(1-10)$allow_num|origin$origin_kw>]",
 	NEIGHBOR_STR NEIGHBOR_ADDR_STR2
 	"Accept as-path with my AS present in it\n"
+	"Filter routes using route-map\n"
+	"Name of route-map\n"
 	"Number of occurrences of AS number\n"
 	"Only accept my AS in the as-path if the route was originated in my AS\n")
 
-DEFUN (no_neighbor_allowas_in,
+DEFPY (no_neighbor_allowas_in,
        no_neighbor_allowas_in_cmd,
-       "no neighbor <A.B.C.D|X:X::X:X|WORD> allowas-in [<(1-10)|origin>]",
+       "no neighbor <A.B.C.D|X:X::X:X|WORD>$neighbor allowas-in [route-map [RMAP_NAME]] [<(1-10)|origin>]",
        NO_STR
        NEIGHBOR_STR
        NEIGHBOR_ADDR_STR2
        "allow local ASN appears in aspath attribute\n"
+       "Filter routes using route-map\n"
+       "Name of route-map\n"
        "Number of occurrences of AS number\n"
        "Only accept my AS in the as-path if the route was originated in my AS\n")
 {
-	int idx_peer = 2;
 	int ret;
 	struct peer *peer;
 
-	peer = peer_and_group_lookup_vty(vty, argv[idx_peer]->arg);
+	peer = peer_and_group_lookup_vty(vty, neighbor);
 	if (!peer)
 		return CMD_WARNING_CONFIG_FAILED;
 
@@ -9785,9 +9786,11 @@ DEFUN (no_neighbor_allowas_in,
 
 ALIAS_HIDDEN(
 	no_neighbor_allowas_in, no_neighbor_allowas_in_hidden_cmd,
-	"no neighbor <A.B.C.D|X:X::X:X|WORD> allowas-in [<(1-10)|origin>]",
+	"no neighbor <A.B.C.D|X:X::X:X|WORD>$neighbor allowas-in [route-map [RMAP_NAME]] [<(1-10)|origin>]",
 	NO_STR NEIGHBOR_STR NEIGHBOR_ADDR_STR2
 	"allow local ASN appears in aspath attribute\n"
+	"Filter routes using route-map\n"
+	"Name of route-map\n"
 	"Number of occurrences of AS number\n"
 	"Only accept my AS in the as-path if the route was originated in my AS\n")
 
@@ -15619,6 +15622,10 @@ static void bgp_show_peer_afi(struct vty *vty, struct peer *p, afi_t afi,
 			else
 				json_object_int_add(json_addr, "allowAsInCount",
 						    p->allowas_in[afi][safi]);
+
+			if (p->allowas_in_rmap[afi][safi].name)
+				json_object_string_add(json_addr, "allowAsInRouteMap",
+						       p->allowas_in_rmap[afi][safi].name);
 		}
 
 		if (p->addpath_type[afi][safi] != BGP_ADDPATH_NONE)
@@ -15937,9 +15944,12 @@ static void bgp_show_peer_afi(struct vty *vty, struct peer *p, afi_t afi,
 				vty_out(vty,
 					"  Local AS allowed as path origin\n");
 			else
-				vty_out(vty,
-					"  Local AS allowed in path, %d occurrences\n",
+				vty_out(vty, "  Local AS allowed in path, %d occurrences\n",
 					p->allowas_in[afi][safi]);
+
+			if (p->allowas_in_rmap[afi][safi].name)
+				vty_out(vty, "  Local AS allowed with route-map: %s\n",
+					p->allowas_in_rmap[afi][safi].name);
 		}
 
 		if (p->addpath_type[afi][safi] != BGP_ADDPATH_NONE)
@@ -20497,6 +20507,14 @@ DEFPY(bgp_ls_distribute_bgp_fabric,
 	bgp->ls_info->instance_id = instance_id;
 	bgp->ls_info->enable_distribution = true;
 
+	bgp_redist_add(bgp, AFI_IP6, ZEBRA_ROUTE_ALL, 0);
+	if (bgp_redistribute_set(bgp, AFI_IP6, ZEBRA_ROUTE_ALL, 0, false) != CMD_SUCCESS)
+		zlog_warn("%s: failed to subscribe to IPv6 ZEBRA_ROUTE_ALL redistribution",
+			  __func__);
+
+	if (bgp_zclient && bgp_zclient->sock >= 0)
+		bgp_zebra_srv6_manager_get_locator(NULL);
+
 	if (bgp_ls_export_bgp_topology(bgp) != 0) {
 		vty_out(vty, "%% Failed to export BGP topology\n");
 		return CMD_WARNING;
@@ -20534,6 +20552,8 @@ DEFPY(no_bgp_ls_distribute_bgp_fabric,
 	if (bgp->ls_info) {
 		if (!bgp->ls_info->enable_distribution)
 			return CMD_SUCCESS;
+
+		bgp_redistribute_unset(bgp, AFI_IP6, ZEBRA_ROUTE_ALL, 0);
 
 		bgp->ls_info->enable_distribution = false;
 		bgp->ls_info->instance_id = 0;
@@ -21665,14 +21685,29 @@ static void bgp_config_write_peer_af(struct vty *vty, struct bgp *bgp,
 
 	/* allowas-in <1-10> */
 	if (peergroup_af_flag_check(peer, afi, safi, PEER_FLAG_ALLOWAS_IN)) {
-		if (peer_af_flag_check(peer, afi, safi,
-				       PEER_FLAG_ALLOWAS_IN_ORIGIN)) {
-			vty_out(vty, "  neighbor %s allowas-in origin\n", addr);
-		} else if (peer->allowas_in[afi][safi] == BGP_ALLOWAS_IN_DEFAULT) {
-			vty_out(vty, "  neighbor %s allowas-in\n", addr);
+		if (peer->allowas_in_rmap[afi][safi].name) {
+			/* allowas-in with route-map */
+			if (peer_af_flag_check(peer, afi, safi, PEER_FLAG_ALLOWAS_IN_ORIGIN)) {
+				vty_out(vty, "  neighbor %s allowas-in route-map %s origin\n",
+					addr, peer->allowas_in_rmap[afi][safi].name);
+			} else if (peer->allowas_in[afi][safi] == BGP_ALLOWAS_IN_DEFAULT) {
+				vty_out(vty, "  neighbor %s allowas-in route-map %s\n", addr,
+					peer->allowas_in_rmap[afi][safi].name);
+			} else {
+				vty_out(vty, "  neighbor %s allowas-in route-map %s %d\n", addr,
+					peer->allowas_in_rmap[afi][safi].name,
+					peer->allowas_in[afi][safi]);
+			}
 		} else {
-			vty_out(vty, "  neighbor %s allowas-in %d\n", addr,
-				peer->allowas_in[afi][safi]);
+			/* regular allowas-in without filtering */
+			if (peer_af_flag_check(peer, afi, safi, PEER_FLAG_ALLOWAS_IN_ORIGIN)) {
+				vty_out(vty, "  neighbor %s allowas-in origin\n", addr);
+			} else if (peer->allowas_in[afi][safi] == BGP_ALLOWAS_IN_DEFAULT) {
+				vty_out(vty, "  neighbor %s allowas-in\n", addr);
+			} else {
+				vty_out(vty, "  neighbor %s allowas-in %d\n", addr,
+					peer->allowas_in[afi][safi]);
+			}
 		}
 	}
 
